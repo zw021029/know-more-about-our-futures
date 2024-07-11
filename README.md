@@ -2,7 +2,7 @@
 Promoting the awareness of the worldwide people towards our common futures.
 Especially, AI development, Climate change and Inequality
 
-# Principle:「FFOS: Facts first, opinions second」
+## Principle:「FFOS: Facts first, opinions second」
 1. Data-based & Unbiased.
 2. Intersting & Interactive.
 3. Meaningful & Thought-provoking.
