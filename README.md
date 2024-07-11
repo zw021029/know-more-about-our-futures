@@ -1,7 +1,7 @@
 # Know More about Our Futures 🌏
 Promoting the awareness of the worldwide people towards our common futures.
 
-Especially, AI development, Climate change and Inequality
+Especially, AI development, Climate change and Equality
 
 ## Principle: **「FFOS: Facts first, opinions second」**
 1. Data-based & Unbiased.
