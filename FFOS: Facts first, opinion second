@@ -1,1 +1,312 @@
+# 导入必要的库
+import re
+import torch
+import torch.nn.functional as F
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import stanza
+from datasets import load_dataset, Dataset
+import random
+import synonyms
+import optuna
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 初始化 Stanza 的中文模型
+# 如果尚未下载中文模型，需先执行 stanza.download('zh')
+stanza.download('zh')  # 仅需首次运行时执行
+nlp = stanza.Pipeline('zh', processors='tokenize,pos,lemma,depparse', use_gpu=False)
+
+# 定义可扩展的逻辑规则
+opinion_words = [
+    '我认为', '我觉得', '在我看来', '可能', '也许', '应该', '建议', '猜想', '倾向于', '似乎',
+    '恐怕', '估计', '希望', '需要', '必须', '觉得', '认为', '希望', '恐怕', '或许', '大概',
+    '最好', '令人遗憾', '遗憾的是', '幸好', '可惜', '值得', '不幸的是', '很棒', '令人失望', '惊人'
+]
+fact_indicators = [
+    '根据', '数据显示', '事实是', '研究表明', '证据显示', '调查发现', '证明', '证实', '确认',
+    '报道', '宣布', '指出', '统计显示', '近年来', '一直以来', '普遍认为', '众所周知', '毫无疑问',
+    '显然', '事实证明', '结果显示', '历史上', '客观来说', '事实上', '最新的数据', '市场份额', '创新能力'
+]
+
+# 数据增强函数
+def data_augmentation(sentence, n_aug=2):
+    augmented_sentences = []
+    for _ in range(n_aug):
+        words = list(sentence)
+        new_sentence = words.copy()
+        op = random.choice(['synonym_replace', 'random_insert', 'random_delete'])
+        
+        if op == 'synonym_replace':
+            idx = random.randint(0, len(words)-1)
+            syns = synonyms.nearby(words[idx])[0]
+            if syns:
+                new_word = random.choice(syns)
+                new_sentence[idx] = new_word
+        elif op == 'random_insert':
+            idx = random.randint(0, len(words))
+            new_word = random.choice(words)
+            new_sentence.insert(idx, new_word)
+        elif op == 'random_delete' and len(words) > 1:
+            idx = random.randint(0, len(words)-1)
+            del new_sentence[idx]
+        
+        augmented_sentences.append(''.join(new_sentence))
+    return augmented_sentences
+
+# 加载和增强数据集
+def load_and_augment_data(file_path):
+    dataset = load_dataset('csv', data_files={'train': file_path})
+    sentences = dataset['train']['sentence']
+    labels = dataset['train']['label']
+    
+    augmented_sentences = []
+    augmented_labels = []
+    
+    for sentence, label in zip(sentences, labels):
+        augmented_sentences.append(sentence)
+        augmented_labels.append(label)
+        
+        # 对每个句子进行数据增强
+        augmented_sents = data_augmentation(sentence, n_aug=2)  # 每个句子生成2个增强句子
+        augmented_sentences.extend(augmented_sents)
+        augmented_labels.extend([label]*len(augmented_sents))
+    
+    # 创建新的数据集
+    new_dataset = Dataset.from_dict({'sentence': augmented_sentences, 'label': augmented_labels})
+    return new_dataset
+
+# 数据预处理函数
+def preprocess_function(examples):
+    return tokenizer(examples['sentence'], truncation=True, padding='max_length', max_length=128)
+
+# 定义模型微调和超参数调优
+def model_training():
+    # 加载分词器
+    tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
+    
+    # 加载和增强训练数据
+    train_dataset = load_and_augment_data('train.csv')
+    eval_dataset = load_and_augment_data('eval.csv')
+    
+    # 应用数据预处理
+    train_dataset = train_dataset.map(preprocess_function, batched=True)
+    eval_dataset = eval_dataset.map(preprocess_function, batched=True)
+    
+    # 设置格式
+    train_dataset = train_dataset.map(lambda examples: {'labels': examples['label']})
+    eval_dataset = eval_dataset.map(lambda examples: {'labels': examples['label']})
+    train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    eval_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    
+    # 定义指标计算函数
+    def compute_metrics(eval_pred):
+        from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+        logits, labels = eval_pred
+        predictions = torch.argmax(torch.Tensor(logits), dim=-1)
+        precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary')
+        acc = accuracy_score(labels, predictions)
+        return {'accuracy': acc, 'f1': f1, 'precision': precision, 'recall': recall}
+    
+    # 使用 Optuna 进行超参数调优
+    def model_init():
+        return BertForSequenceClassification.from_pretrained('bert-base-chinese', num_labels=2)
+    
+    def objective(trial):
+        # 定义要调优的超参数
+        learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 5e-5)
+        num_train_epochs = trial.suggest_int('num_train_epochs', 2, 5)
+        per_device_train_batch_size = trial.suggest_categorical('per_device_train_batch_size', [8, 16, 32])
+        
+        # 设置训练参数
+        training_args = TrainingArguments(
+            output_dir='./results',
+            num_train_epochs=num_train_epochs,
+            per_device_train_batch_size=per_device_train_batch_size,
+            per_device_eval_batch_size=16,
+            evaluation_strategy="epoch",
+            save_strategy="no",
+            logging_dir='./logs',
+            learning_rate=learning_rate,
+            load_best_model_at_end=False,
+        )
+        
+        # 创建 Trainer
+        trainer = Trainer(
+            model_init=model_init,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            compute_metrics=compute_metrics,
+        )
+        
+        # 进行训练
+        trainer.train()
+        
+        # 评估模型
+        eval_result = trainer.evaluate()
+        return eval_result['eval_f1']  # 以 F1 分数作为优化目标
+    
+    # 创建 Optuna 的研究对象
+    study = optuna.create_study(direction='maximize')
+    
+    # 开始超参数调优
+    study.optimize(objective, n_trials=10)
+    
+    # 输出最优超参数
+    print("Best hyperparameters: ", study.best_params)
+    
+    # 使用最优超参数重新训练模型
+    best_hyperparameters = study.best_params
+    
+    training_args = TrainingArguments(
+        output_dir='./results',
+        num_train_epochs=best_hyperparameters['num_train_epochs'],
+        per_device_train_batch_size=best_hyperparameters['per_device_train_batch_size'],
+        per_device_eval_batch_size=16,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_dir='./logs',
+        learning_rate=best_hyperparameters['learning_rate'],
+        load_best_model_at_end=True,
+    )
+    
+    trainer = Trainer(
+        model_init=model_init,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        compute_metrics=compute_metrics,
+    )
+    
+    trainer.train()
+    
+    # 保存微调后的模型
+    trainer.save_model('./fine_tuned_model_best')
+    tokenizer.save_pretrained('./fine_tuned_model_best')
+
+# 模型集成：假设我们有三个微调后的模型
+# 这里为了示例，我们假设已经微调并保存了三个模型
+def load_models():
+    # 加载分词器（假设三个模型使用相同的分词器）
+    tokenizer = BertTokenizer.from_pretrained('./fine_tuned_model_best')
+    
+    # 加载三个微调后的模型
+    model1 = BertForSequenceClassification.from_pretrained('./fine_tuned_model_best')
+    model2 = BertForSequenceClassification.from_pretrained('./fine_tuned_model_best')
+    model3 = BertForSequenceClassification.from_pretrained('./fine_tuned_model_best')
+    
+    # 将模型设置为评估模式
+    model1.eval()
+    model2.eval()
+    model3.eval()
+    
+    return tokenizer, model1, model2, model3
+
+# 定义句子分割函数
+def split_sentences(text):
+    # 使用正则表达式按照中文标点符号分割句子
+    sentences = re.split(r'(?<=[。！？])', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return sentences
+
+# 定义逻辑学判别函数，包含扩展的逻辑规则和依存句法分析
+def logical_judgment(sentence):
+    # 初始化逻辑分数
+    logic_score = 0
+
+    # 判断是否包含观点性词汇
+    for word in opinion_words:
+        if word in sentence:
+            logic_score -= 1  # 减少分数表示更倾向于观点
+
+    # 判断是否包含事实性指示词
+    for word in fact_indicators:
+        if word in sentence:
+            logic_score += 1  # 增加分数表示更倾向于事实
+
+    # 使用依存句法分析
+    doc = nlp(sentence)
+    for sent in doc.sentences:
+        for word in sent.words:
+            # 识别情态动词和主观评价
+            if word.upos == 'VERB' and ('Mood=Pot' in word.feats or 'Mood=Sub' in word.feats):
+                logic_score -= 1  # 可能是观点
+            if word.upos == 'ADJ':
+                logic_score -= 0.5  # 主观评价
+
+            # 识别客观陈述
+            if word.upos == 'NOUN' and word.deprel in ['nsubj', 'obj']:
+                logic_score += 0.5  # 可能是事实
+
+            # 识别副词（可能表示程度或主观态度）
+            if word.upos == 'ADV' and word.text in ['非常', '十分', '极其', '相当', '特别', '有点', '稍微']:
+                logic_score -= 0.5  # 主观程度
+
+    return logic_score
+
+# 定义处理单个句子的函数，使用模型集成
+def process_sentence_ensemble(sentence, tokenizer, model1, model2, model3):
+    # 集成预测
+    inputs = tokenizer(sentence, return_tensors='pt', truncation=True, padding=True)
+    with torch.no_grad():
+        logits1 = model1(**inputs).logits
+        logits2 = model2(**inputs).logits
+        logits3 = model3(**inputs).logits
+
+    # 计算平均概率（软投票）
+    probs1 = torch.softmax(logits1, dim=1)
+    probs2 = torch.softmax(logits2, dim=1)
+    probs3 = torch.softmax(logits3, dim=1)
+    
+    avg_probs = (probs1 + probs2 + probs3) / 3
+    probability = avg_probs[:, 1].item()  # 取事实类别的概率
+
+    # 应用逻辑学判别
+    logic_score = logical_judgment(sentence)
+    # 综合模型预测概率和逻辑得分
+    adjusted_probability = probability + 0.1 * logic_score  # 权重系数可调整
+    # 确保概率在 0 到 1 之间
+    adjusted_probability = min(max(adjusted_probability, 0), 1)
+    return (sentence, adjusted_probability)
+
+# 定义 FFOS 函数，使用多线程处理
+def FFOS(text):
+    # 输入验证
+    if not text or not isinstance(text, str):
+        raise ValueError("输入的文本不能为空，且必须为字符串类型。")
+    try:
+        sentences = split_sentences(text)
+        results = []
+        
+        # 加载模型和分词器
+        tokenizer, model1, model2, model3 = load_models()
+        
+        # 使用 ThreadPoolExecutor 进行多线程处理
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(process_sentence_ensemble, sentence, tokenizer, model1, model2, model3): sentence for sentence in sentences}
+            for future in as_completed(futures):
+                sentence, adjusted_probability = future.result()
+                results.append((sentence, adjusted_probability))
+        
+        # 保持原有句子顺序
+        results.sort(key=lambda x: sentences.index(x[0]))
+        return results
+    except Exception as e:
+        print(f"处理过程中出现错误：{e}")
+        return []
+
+# 测试
+if __name__ == "__main__":
+    # 首次运行需要进行模型训练
+    # model_training()
+    
+    text = (
+        "苹果公司是一家科技公司。他们的产品很棒。"
+        "我认为他们的股票会继续上涨。根据最新的数据，他们的市场份额正在扩大。"
+        "估计未来会有更大的增长。众所周知，他们的创新能力非常强。"
+        "可惜的是，最近的新品发布会令人失望。"
+    )
+    results = FFOS(text)
+    for sentence, probability in results:
+        print(f"{sentence} -> 概率：{probability:.2f}")
 
